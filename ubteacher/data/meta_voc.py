@@ -130,15 +130,6 @@ def load_filtered_voc_instances(
             r["annotations"] = instances
             dicts.append(r)
 
-    # merged_dicts = {}
-    # for dict in dicts:
-    #     filename = dict["file_name"]
-    #     anno = dict["annotations"]
-    #     if filename in merged_dicts:
-    #         merged_dicts[filename]["annotations"].extend(anno)
-    #     else:
-    #         merged_dicts[filename] = dict
-    # new_dicts = list(merged_dicts.values())
     return dicts
 
 
