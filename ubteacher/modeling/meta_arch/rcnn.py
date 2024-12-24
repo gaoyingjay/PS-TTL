@@ -238,7 +238,6 @@ class DefrcnTwoStagePseudoLabGeneralizedRCNN(GeneralizedRCNN):
     
     def init_prototypes(self, batched_inputs):
         images = self.preprocess_image(batched_inputs)
-
         gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
 
         features = self.backbone(images.tensor)

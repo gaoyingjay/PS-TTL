@@ -38,9 +38,9 @@ class Res5ROIHeadsPseudoLab(Res5ROIHeads):
         else:
             raise ValueError("Unknown ROI head loss.")
         
-        #维护类原型
+        # 维护类原型
         self.num_classes = cfg.MODEL.ROI_HEADS.NUM_CLASSES
-        self.queue_len = 128
+        self.queue_len = 128 # cfg.MODEL.ROI_HEADS.QUEUE_LEN
         if True:
             self.register_buffer("queue_s", torch.zeros(self.num_classes, self.queue_len, out_channels))
             self.register_buffer("queue_ptr", torch.zeros(self.num_classes, dtype=torch.long))
@@ -73,9 +73,6 @@ class Res5ROIHeadsPseudoLab(Res5ROIHeads):
         
     @torch.no_grad()
     def update_memory(self, features_s, gt_classes):
-        # features_s = concat_all_gather(features_s)
-        # gt_classes = concat_all_gather(gt_classes)
-        
         fg_cases = (gt_classes >= 0) & (gt_classes < self.num_classes)
         features_fg_s = features_s[fg_cases]
         gt_classes_fg = gt_classes[fg_cases]
@@ -99,8 +96,10 @@ class Res5ROIHeadsPseudoLab(Res5ROIHeads):
             [features[f] for f in self.in_features], gt_boxes
         )
         feature_pooled_s = box_features.mean(dim=[2, 3])
+
         gt_classes = torch.cat([x.gt_classes for x in targets], dim=0)
-        self.update_memory(feature_pooled_s, gt_classes)
+
+        self.update_memory(feature_pooled_s.detach(), gt_classes)
     
     @torch.no_grad()
     def get_prototypes(self):
@@ -120,27 +119,17 @@ class Res5ROIHeadsPseudoLab(Res5ROIHeads):
                 prototypes_s_avg = self.queue_s[i].mean(dim=0)
             else:
                 prototypes_s_avg = self.queue_s[i][:self.queue_ptr[i]].mean(dim=0)
+            
             alpha = 0.5
-            # alpha = (F.cosine_similarity(self.prototypes_s[i], prototypes_s_avg, dim=0).item()+ 1) / 2.0
+            # alpha = (F.cosine_similarity(self.prototypes_s[i], prototypes_s_avg, dim=0).item() + 1) / 2.0
             self.prototypes_s[i] = self.prototypes_s[i] * alpha + prototypes_s_avg * (1-alpha)
 
     @torch.no_grad()
     def predict_prototype(self, feature_pooled_s, gt_classes):
 
         predict_cosine_s = F.cosine_similarity(feature_pooled_s[:, None], self.prototypes_s[None, :], dim=-1)
-        # predict_classes_s = predict_cosine_s.new_full(predict_cosine_s.size(), -1.0)
-        # predict_classes_s[:, self.novel_index] = predict_cosine_s[:, self.novel_index]
-        
-        # for i in range(len(predict_classes_s)):
-        #     if gt_classes[i] == self.num_classes or gt_classes[i] < 0:
-        #         continue
-        #     predict_classes_s[i, gt_classes[i]] = predict_cosine_s[i, gt_classes[i]]
-        # max_values, _ = torch.max(predict_cosine_s, dim=1)
-        # result_tensor = torch.zeros_like(predict_cosine_s)
-        # result_tensor.scatter_(1, torch.argmax(predict_cosine_s, dim=1, keepdim=True), max_values.view(-1, 1))
-        # result_tensor[:, self.novel_index] = predict_cosine_s[:, self.novel_index]
         predict_classes_s = predict_cosine_s
-        # predict_classes_s = result_tensor
+        
         zeros = torch.zeros((len(predict_classes_s), 1), device=predict_classes_s.device)
         
         predict_classes_s = F.softmax(predict_classes_s*10, dim=-1)
@@ -173,27 +162,30 @@ class Res5ROIHeadsPseudoLab(Res5ROIHeads):
         )
         predictions = self.box_predictor(box_features.mean(dim=[2, 3]))
         
-        # if branch == "supervised_test": # or branch == "supervised":
-        #     gt_classes = cat([p.gt_classes for p in proposals], dim=0)
-        #     feature_pooled_s = box_features.mean(dim=[2, 3])
-        #     self.update_memory(feature_pooled_s.detach(), gt_classes)
-        #     self.updata_prototypes()
+        # 更新类原型
         if branch == "supervised_test":
-            pred_class_logits = predictions[0]
+            gt_classes = cat([p.gt_classes for p in proposals], dim=0)
             feature_pooled_s = box_features.mean(dim=[2, 3])
+            self.update_memory(feature_pooled_s.detach(), gt_classes)
+
+            self.updata_prototypes()
+        
+        if branch == "supervised_test":
+            pred_class_logits, _ = predictions
 
             gt_classes = cat([p.gt_classes for p in proposals], dim=0)
-            # bg_class_ind = pred_class_logits.shape[1] - 1
-            # true_cases = (gt_classes >= 0) & (gt_classes < bg_class_ind)
-            true_cases = gt_classes == 21
+            # unknown_class_idx = num_classes + 1
+            true_cases = (gt_classes == self.num_classes + 1)
             
+            feature_pooled_s = box_features.mean(dim=[2, 3])
+
             gt_prototype_classes_s = self.predict_prototype(feature_pooled_s, gt_classes)
             gt_prototype_classes_s = gt_prototype_classes_s.detach()
         
             losses = self.box_predictor.losses(predictions, proposals, branch)
             if torch.all(true_cases.eq(False)):
+                # no unknown class
                 pass
-                # print("nan")
             else:
                 loss_kld = F.kl_div(F.log_softmax(pred_class_logits[true_cases], dim=1),
                     gt_prototype_classes_s[true_cases], reduction='batchmean')

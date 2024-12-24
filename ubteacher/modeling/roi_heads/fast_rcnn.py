@@ -14,6 +14,7 @@ from detectron2.layers import cat, cross_entropy, nonzero_tuple
 class FastRCNNCrossEntropyLossOutputLayers(FastRCNNOutputLayers):
     def __init__(self, cfg, input_shape):
         super(FastRCNNCrossEntropyLossOutputLayers, self).__init__(cfg, input_shape)
+        self.num_classes = cfg.MODEL.ROI_HEADS.NUM_CLASSES
         self._do_cls_dropout = cfg.MODEL.ROI_HEADS.CLS_DROPOUT
         self._dropout_ratio = cfg.MODEL.ROI_HEADS.DROPOUT_RATIO
     
@@ -61,12 +62,9 @@ class FastRCNNCrossEntropyLossOutputLayers(FastRCNNOutputLayers):
         return {k: v * self.loss_weight.get(k, 1.0) for k, v in losses.items()}
 
     def softmax_cross_entropy_loss(self, scores, gt_classes, branch):
-        # if branch == "supervised_few":
-        mask = gt_classes != 21
+        # unknown_class_idx = num_classes + 1
+        mask = (gt_classes != self.num_classes + 1)
         return cross_entropy(scores[mask], gt_classes[mask], reduction="mean")
-        # elif branch == "supervised_test":
-        #     fg_inds = nonzero_tuple((gt_classes >= 0) & (gt_classes < self.num_classes))[0]
-        #     return cross_entropy(scores[fg_inds], gt_classes[fg_inds], reduction="sum") / 1024
 
 
 # focal loss

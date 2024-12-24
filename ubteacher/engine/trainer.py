@@ -282,8 +282,8 @@ class UBTeacherTrainer(DefaultTrainer):
         cfg = DefaultTrainer.auto_scale_workers(cfg, comm.get_world_size())
         data_loader = self.build_train_loader(cfg)
 
-        # #few-shot data_loader用于初始化类原型
-        # self.fs_data_loader = copy.deepcopy(data_loader.label_dataset)
+        # N-way K-shot data_loader用于初始化类原型
+        self.NK_data_loader = copy.deepcopy(data_loader.label_dataset)
 
         # create a student model
         model = self.build_model(cfg)
@@ -397,11 +397,36 @@ class UBTeacherTrainer(DefaultTrainer):
         with EventStorage(start_iter) as self.storage:
             try:
                 self.before_train()
+                
+                # test-time learning evaluation 0
+                test_data_loader = self.build_test_loader(self.cfg, self.cfg.DATASETS.TEST[0])
+                test_data_loader_iter = iter(test_data_loader)
+                test_evaluator = self.build_evaluator(self.cfg, self.cfg.DATASETS.TEST[0])
+                test_evaluator.reset()
 
                 for self.iter in range(start_iter, max_iter):
                     self.before_step()
                     self.run_step_full_semisup()
                     self.after_step()
+                    
+                    # test-time learning evaluation 1
+                    self.model.eval()
+                    self.model_teacher.eval()
+
+                    with torch.no_grad():
+                        # bs = 1, unlabel_sampler shuffle=False
+                        test_data = next(test_data_loader_iter)
+                        output_student = self.model(test_data)
+                        output_teacher = self.model_teacher(test_data)
+                        test_evaluator.process(test_data, output_teacher)
+
+                    self.model.train()
+                    self.model_teacher.train()
+                
+                # test-time learning evaluation 2
+                test_results = test_evaluator.evaluate()
+                print(test_results)
+
             except Exception:
                 logger.exception("Exception during training:")
                 raise
@@ -447,53 +472,55 @@ class UBTeacherTrainer(DefaultTrainer):
             new_proposal_inst.gt_classes = proposal_bbox_inst.pred_classes[valid_map]
             new_proposal_inst.scores = proposal_bbox_inst.scores[valid_map]
             
-            # generate unknow class
-            unkonw_thres = 0.5
-            unknow_valid_map = (proposal_bbox_inst.scores > unkonw_thres) & (
+            # generate unknown class
+            unknown_thres = 0.5 # self.cfg.SEMISUPNET.UNKNOWN_THRESHOLD
+            unknown_valid_map = (proposal_bbox_inst.scores > unknown_thres) & (
                                 proposal_bbox_inst.scores <= thres)
 
             # create box
-            unknow_new_bbox_loc = proposal_bbox_inst.pred_boxes.tensor[unknow_valid_map, :]
-            unknow_new_boxes = Boxes(unknow_new_bbox_loc)
+            unknown_new_bbox_loc = proposal_bbox_inst.pred_boxes.tensor[unknown_valid_map, :]
+            unknown_new_boxes = Boxes(unknown_new_bbox_loc)
 
-            unknow_new_scores = proposal_bbox_inst.scores[unknow_valid_map]
+            unknown_new_scores = proposal_bbox_inst.scores[unknown_valid_map]
             
             if len(new_proposal_inst) != 0:
                 for idx in range(len(new_proposal_inst)):
-                    if len(unknow_new_boxes) == 0:
+                    if len(unknown_new_boxes) == 0:
                         break
                     combined_new_boxes = Boxes.cat([new_proposal_inst.gt_boxes[idx], 
-                                                    unknow_new_boxes])
+                                                    unknown_new_boxes])
                     combined_scores = torch.cat([new_proposal_inst.scores[idx].unsqueeze(0), 
-                                                unknow_new_scores])
+                                                unknown_new_scores])
                     filter_inds = torch.zeros(len(combined_new_boxes), dtype=torch.int64)
 
                     keep = batched_nms(combined_new_boxes.tensor, combined_scores, filter_inds, 0.5)
                     
                     keep_valid_map = torch.zeros(len(combined_new_boxes), dtype=torch.bool)
                     keep_valid_map[keep[1:]] = True
-                    unknow_new_boxes = combined_new_boxes[keep_valid_map]
-                    unknow_new_scores = combined_scores[keep_valid_map]
+                    unknown_new_boxes = combined_new_boxes[keep_valid_map]
+                    unknown_new_scores = combined_scores[keep_valid_map]
             else:
-                combined_new_boxes = unknow_new_boxes
-                combined_scores = unknow_new_scores
+                combined_new_boxes = unknown_new_boxes
+                combined_scores = unknown_new_scores
                 filter_inds = torch.zeros(len(combined_new_boxes), dtype=torch.int64)
                 
                 keep = batched_nms(combined_new_boxes.tensor, combined_scores, filter_inds, 0.5)
                     
                 keep_valid_map = torch.zeros(len(combined_new_boxes), dtype=torch.bool)
                 keep_valid_map[keep] = True
-                unknow_new_boxes = combined_new_boxes[keep_valid_map]
-                unknow_new_scores = combined_scores[keep_valid_map]
+                unknown_new_boxes = combined_new_boxes[keep_valid_map]
+                unknown_new_scores = combined_scores[keep_valid_map]
             
-            unknow_new_classes = torch.zeros(len(unknow_new_boxes), dtype=torch.int64).fill_(21).to(unknow_new_boxes.device)
+            # unknown_class_idx = num_classes + 1
+            unknown_class_idx = self.cfg.MODEL.ROI_HEADS.NUM_CLASSES + 1
+            unknown_new_classes = torch.zeros(len(unknown_new_boxes), dtype=torch.int64).fill_(unknown_class_idx).to(unknown_new_boxes.device)
             
             combined_new_proposal_inst = Instances(image_shape)
-            combined_new_proposal_inst.gt_boxes = Boxes.cat([new_proposal_inst.gt_boxes, unknow_new_boxes])
-            combined_new_proposal_inst.gt_classes = torch.cat([new_proposal_inst.gt_classes, unknow_new_classes])
-            combined_new_proposal_inst.scores = torch.cat([new_proposal_inst.scores, unknow_new_scores])
+            combined_new_proposal_inst.gt_boxes = Boxes.cat([new_proposal_inst.gt_boxes, unknown_new_boxes])
+            combined_new_proposal_inst.gt_classes = torch.cat([new_proposal_inst.gt_classes, unknown_new_classes])
+            combined_new_proposal_inst.scores = torch.cat([new_proposal_inst.scores, unknown_new_scores])
 
-            return new_proposal_inst
+            return combined_new_proposal_inst
 
     def process_pseudo_label(
         self, proposals_rpn_unsup_k, cur_threshold, proposal_type, psedo_label_method=""
@@ -562,12 +589,12 @@ class UBTeacherTrainer(DefaultTrainer):
                 # update copy the the whole model
                 self._update_teacher_model(keep_rate=0.00)
 
-                # #根据few-shot数据初始化类原型
-                # with torch.no_grad():
-                #     for idx, inputs in enumerate(self.fs_data_loader.dataset):
-                #         inputs_q, inputs_k = inputs
-                #         self.model.init_prototypes([inputs_q])
-                #     self.model.roi_heads.get_prototypes()
+                # 根据N-way K-shot数据初始化类原型
+                with torch.no_grad():
+                    for idx, nk_data in enumerate(self.NK_data_loader.dataset):
+                        nk_data_q, nk_data_k = nk_data
+                        self.model.init_prototypes([nk_data_q])
+                    self.model.roi_heads.get_prototypes()
             elif (
                 self.iter - self.cfg.SEMISUPNET.BURN_UP_STEP
             ) % self.cfg.SEMISUPNET.TEACHER_UPDATE_ITER == 0:
@@ -613,23 +640,23 @@ class UBTeacherTrainer(DefaultTrainer):
                 unlabel_data_k, joint_proposal_dict["proposals_pseudo_roih"]
             )
 
-            all_label_data = label_data_q
-            all_unlabel_data = unlabel_data_q
+            all_label_data = label_data_q + label_data_k
+            all_unlabel_data = unlabel_data_k
 
             record_all_label_data, _, _, _ = self.model(
                 all_label_data, branch="supervised_few"
             )
-            # record_all_label_data = {}
+            record_all_label_data = {}
             record_dict.update(record_all_label_data)
-            # record_all_unlabel_data, _, _, _ = self.model(
-            #     all_unlabel_data, branch="supervised_test"
-            # )
-            # new_record_all_unlabel_data = {}
-            # for key in record_all_unlabel_data.keys():
-            #     new_record_all_unlabel_data[key + "_pseudo"] = record_all_unlabel_data[
-            #         key
-            #     ]
-            # record_dict.update(new_record_all_unlabel_data)
+            record_all_unlabel_data, _, _, _ = self.model(
+                all_unlabel_data, branch="supervised_test"
+            )
+            new_record_all_unlabel_data = {}
+            for key in record_all_unlabel_data.keys():
+                new_record_all_unlabel_data[key + "_pseudo"] = record_all_unlabel_data[
+                    key
+                ]
+            record_dict.update(new_record_all_unlabel_data)
 
             # weight losses
             loss_dict = {}

@@ -202,8 +202,8 @@ def build_detection_semisup_train_loader_two_crops(cfg, mapper=None):
     logger = logging.getLogger(__name__)
     logger.info("Using training sampler {}".format(sampler_name))
     if sampler_name == "TrainingSampler":
-        label_sampler = TrainingSampler(len(label_dataset))
-        unlabel_sampler = TrainingSampler(len(unlabel_dataset))
+        label_sampler = TrainingSampler(len(label_dataset), shuffle=True)
+        unlabel_sampler = TrainingSampler(len(unlabel_dataset), shuffle=False)
     elif sampler_name == "RepeatFactorTrainingSampler":
         raise NotImplementedError("{} not yet supported.".format(sampler_name))
     else:
